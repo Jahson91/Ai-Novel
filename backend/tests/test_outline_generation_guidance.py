@@ -1,14 +1,26 @@
 from __future__ import annotations
 
+import json
+import re
 from pathlib import Path
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from app.api.routes.outline import (
+    _build_outline_missing_chapters_prompts,
     _build_outline_generation_guidance,
     _enforce_outline_chapter_coverage,
     _extract_target_chapter_count,
+    _fill_outline_missing_chapters_with_llm,
+    _format_chapter_number_ranges,
+    _outline_fill_batch_size_for_missing,
+    _outline_fill_max_attempts_for_missing,
+    _outline_fill_progress_message,
     _recommend_outline_max_tokens,
 )
+from app.core.errors import AppError
+from app.services.generation_service import PreparedLlmCall
 from app.services.prompting import render_template
 
 
@@ -24,6 +36,11 @@ class TestOutlineGenerationGuidance(unittest.TestCase):
     def test_build_outline_generation_guidance_for_long_form(self) -> None:
         guidance = _build_outline_generation_guidance(200)
         self.assertIn("200", guidance["chapter_count_rule"])
+        self.assertIn("每章 1 条", guidance["chapter_detail_rule"])
+
+    def test_build_outline_generation_guidance_for_50_chapters(self) -> None:
+        guidance = _build_outline_generation_guidance(50)
+        self.assertIn("50", guidance["chapter_count_rule"])
         self.assertIn("1~2", guidance["chapter_detail_rule"])
 
     def test_build_outline_generation_guidance_default(self) -> None:
@@ -41,6 +58,26 @@ class TestOutlineGenerationGuidance(unittest.TestCase):
                 current_max_tokens=4096,
             ),
             12000,
+        )
+        # 50 chapters should use aggressive max_tokens to avoid truncation.
+        self.assertEqual(
+            _recommend_outline_max_tokens(
+                target_chapter_count=50,
+                provider="openai",
+                model="gpt-4o-mini",
+                current_max_tokens=4096,
+            ),
+            12000,
+        )
+        # 40 chapters recommendation is lower than >40 bracket.
+        self.assertEqual(
+            _recommend_outline_max_tokens(
+                target_chapter_count=40,
+                provider="openai",
+                model="gpt-4o-mini",
+                current_max_tokens=4096,
+            ),
+            8192,
         )
         # gpt-4 output limit is 8192; recommendation should be clamped.
         self.assertEqual(
@@ -90,8 +127,9 @@ class TestOutlineGenerationGuidance(unittest.TestCase):
         rendered_default, _missing_default, error_default = render_template(template, values={}, macro_seed="test-seed")
         self.assertIsNone(error_default)
         self.assertIn("beats 每章 5~9 条", rendered_default)
+        self.assertIn("严禁输出“待补全/自动补齐/占位/TODO/略”等占位内容", rendered_default)
 
-    def test_enforce_outline_chapter_coverage_autofills_missing_numbers(self) -> None:
+    def test_enforce_outline_chapter_coverage_marks_missing_numbers_without_padding(self) -> None:
         data = {
             "outline_md": "x",
             "chapters": [
@@ -101,11 +139,11 @@ class TestOutlineGenerationGuidance(unittest.TestCase):
         }
         out, warnings = _enforce_outline_chapter_coverage(data=data, target_chapter_count=4)
         chapters = out["chapters"]
-        self.assertEqual([c["number"] for c in chapters], [1, 2, 3, 4])
-        self.assertIn("outline_chapter_coverage_autofilled", warnings)
+        self.assertEqual([c["number"] for c in chapters], [1, 3])
+        self.assertIn("outline_chapter_coverage_incomplete", warnings)
         coverage = out.get("chapter_coverage") or {}
-        self.assertEqual(coverage.get("filled_missing_numbers"), [2, 4])
-        self.assertEqual(coverage.get("filled_missing_count"), 2)
+        self.assertEqual(coverage.get("missing_numbers"), [2, 4])
+        self.assertEqual(coverage.get("missing_count"), 2)
 
     def test_enforce_outline_chapter_coverage_dedupes_and_filters_extra(self) -> None:
         data = {
@@ -119,18 +157,171 @@ class TestOutlineGenerationGuidance(unittest.TestCase):
         }
         out, warnings = _enforce_outline_chapter_coverage(data=data, target_chapter_count=3)
         chapters = out["chapters"]
-        self.assertEqual([c["number"] for c in chapters], [1, 2, 3])
-        self.assertEqual(chapters[1]["title"], "第二章完整版")
+        self.assertEqual([c["number"] for c in chapters], [2])
+        self.assertEqual(chapters[0]["title"], "第二章完整版")
         self.assertIn("outline_chapter_number_deduped", warnings)
         self.assertIn("outline_chapter_invalid_filtered", warnings)
         self.assertIn("outline_chapter_beyond_target_filtered", warnings)
-        self.assertIn("outline_chapter_coverage_autofilled", warnings)
+        self.assertIn("outline_chapter_coverage_incomplete", warnings)
 
     def test_enforce_outline_chapter_coverage_no_target_is_noop(self) -> None:
         data = {"outline_md": "x", "chapters": [{"number": 1, "title": "第一章", "beats": ["a"]}]}
         out, warnings = _enforce_outline_chapter_coverage(data=data, target_chapter_count=None)
         self.assertEqual(out["chapters"], data["chapters"])
         self.assertEqual(warnings, [])
+
+    def test_format_chapter_number_ranges(self) -> None:
+        self.assertEqual(_format_chapter_number_ranges([1, 2, 3, 7, 9, 10]), "1-3, 7, 9-10")
+        self.assertEqual(_format_chapter_number_ranges([5]), "5")
+        self.assertEqual(_format_chapter_number_ranges([]), "")
+
+    def test_outline_fill_batch_size_is_adaptive(self) -> None:
+        self.assertEqual(_outline_fill_batch_size_for_missing(0), 6)
+        self.assertEqual(_outline_fill_batch_size_for_missing(9), 6)
+        self.assertEqual(_outline_fill_batch_size_for_missing(10), 8)
+        self.assertEqual(_outline_fill_batch_size_for_missing(24), 10)
+        self.assertEqual(_outline_fill_batch_size_for_missing(50), 12)
+        self.assertEqual(_outline_fill_batch_size_for_missing(90), 14)
+        self.assertEqual(_outline_fill_batch_size_for_missing(200), 18)
+
+    def test_outline_fill_max_attempts_scales_for_weak_models(self) -> None:
+        # Missing 45 chapters must not be capped to a tiny fixed retry count.
+        self.assertEqual(_outline_fill_max_attempts_for_missing(45), 11)
+        # Missing 195 chapters should provide enough rounds for incremental completion.
+        self.assertEqual(_outline_fill_max_attempts_for_missing(195), 41)
+        self.assertEqual(_outline_fill_max_attempts_for_missing(0), 1)
+
+    def test_outline_fill_progress_message(self) -> None:
+        self.assertEqual(
+            _outline_fill_progress_message({"attempt": 2, "max_attempts": 11, "remaining_count": 37}),
+            "补全缺失章节... 第 2/11 轮，剩余 37 章",
+        )
+        self.assertEqual(
+            _outline_fill_progress_message({"remaining_count": 9}),
+            "补全缺失章节... 剩余 9 章",
+        )
+        self.assertEqual(_outline_fill_progress_message(None), "补全缺失章节...")
+
+    def test_fill_prompt_uses_style_samples_and_adaptive_detail_rule(self) -> None:
+        existing = [
+            {"number": 1, "title": "第一章", "beats": ["a1", "a2", "a3", "a4"]},
+            {"number": 2, "title": "第二章", "beats": ["b1", "b2", "b3", "b4"]},
+            {"number": 3, "title": "第三章", "beats": ["c1", "c2", "c3", "c4"]},
+            {"number": 4, "title": "第四章", "beats": ["d1", "d2", "d3", "d4"]},
+        ]
+        _system, user = _build_outline_missing_chapters_prompts(
+            target_chapter_count=50,
+            missing_numbers=[5, 6, 7],
+            existing_chapters=existing,
+            outline_md="x",
+        )
+        self.assertIn("风格参考样本", user)
+        self.assertIn("中位数约 4 条", user)
+        self.assertIn("本轮建议每章", user)
+
+    def test_fill_missing_chapters_keeps_progressing_for_weak_model(self) -> None:
+        llm_call = PreparedLlmCall(
+            provider="openai",
+            model="gpt-4o-mini",
+            base_url="",
+            timeout_seconds=180,
+            params={"max_tokens": 12000},
+            params_json=json.dumps({"max_tokens": 12000}, ensure_ascii=False),
+            extra={},
+        )
+        data = {
+            "outline_md": "x",
+            "chapters": [{"number": i, "title": f"第{i}章", "beats": ["a"]} for i in range(1, 6)],
+        }
+        call_count = {"value": 0}
+        progress_events: list[dict[str, object]] = []
+
+        def _parse_missing_numbers(prompt_user: str) -> list[int]:
+            m = re.search(r"缺失章号：([^\n]+)", prompt_user)
+            if not m:
+                return []
+            text = m.group(1).strip()
+            out: list[int] = []
+            for token in [part.strip() for part in text.split(",") if part.strip()]:
+                if "-" in token:
+                    a, b = token.split("-", 1)
+                    start = int(a.strip())
+                    end = int(b.strip())
+                    out.extend(range(start, end + 1))
+                else:
+                    out.append(int(token))
+            return out
+
+        def _fake_call_llm_and_record(**kwargs):  # type: ignore[no-untyped-def]
+            call_count["value"] += 1
+            prompt_user = str(kwargs.get("prompt_user") or "")
+            missing = _parse_missing_numbers(prompt_user)
+            # Simulate a weak model that only returns 5 chapters per call.
+            selected = missing[:5]
+            chapters = [{"number": n, "title": f"补全{n}", "beats": [f"事件{n}"]} for n in selected]
+            text = json.dumps({"chapters": chapters}, ensure_ascii=False)
+            return SimpleNamespace(text=text, finish_reason="stop", run_id=f"run-{call_count['value']}")
+
+        with patch("app.api.routes.outline.call_llm_and_record", side_effect=_fake_call_llm_and_record):
+            out, warnings, _run_ids = _fill_outline_missing_chapters_with_llm(
+                data=data,
+                target_chapter_count=50,
+                request_id="rid-test",
+                actor_user_id="u1",
+                project_id="p1",
+                api_key="k",
+                llm_call=llm_call,
+                run_params_extra_json={},
+                progress_hook=lambda update: progress_events.append(dict(update)),
+            )
+
+        chapters = out.get("chapters") or []
+        self.assertEqual(len(chapters), 50)
+        self.assertGreater(call_count["value"], 3)
+        coverage = out.get("chapter_coverage") or {}
+        self.assertEqual(coverage.get("missing_count"), 0)
+        self.assertIn("outline_fill_missing_applied", warnings)
+        applied = [e for e in progress_events if e.get("event") == "attempt_applied"]
+        self.assertTrue(applied)
+        latest = applied[-1]
+        self.assertIsInstance(latest.get("chapters_snapshot"), list)
+        self.assertEqual(int(latest.get("chapter_count") or 0), 50)
+
+    def test_fill_missing_chapters_fail_soft_on_llm_error(self) -> None:
+        llm_call = PreparedLlmCall(
+            provider="openai",
+            model="gpt-4o-mini",
+            base_url="",
+            timeout_seconds=180,
+            params={"max_tokens": 12000},
+            params_json=json.dumps({"max_tokens": 12000}, ensure_ascii=False),
+            extra={},
+        )
+        data = {
+            "outline_md": "x",
+            "chapters": [{"number": i, "title": f"第{i}章", "beats": ["a"]} for i in range(1, 6)],
+        }
+
+        with patch(
+            "app.api.routes.outline.call_llm_and_record",
+            side_effect=AppError(code="LLM_TIMEOUT", message="timeout", status_code=504),
+        ):
+            out, warnings, run_ids = _fill_outline_missing_chapters_with_llm(
+                data=data,
+                target_chapter_count=50,
+                request_id="rid-test",
+                actor_user_id="u1",
+                project_id="p1",
+                api_key="k",
+                llm_call=llm_call,
+                run_params_extra_json={},
+            )
+
+        self.assertEqual(run_ids, [])
+        self.assertIn("outline_fill_missing_call_failed", warnings)
+        self.assertIn("outline_fill_missing_timeout", warnings)
+        coverage = out.get("chapter_coverage") or {}
+        self.assertGreater(int(coverage.get("missing_count") or 0), 0)
 
 
 if __name__ == "__main__":
