@@ -20,6 +20,7 @@ from app.llm.utils import default_max_tokens
 from app.main import app_error_handler, validation_error_handler
 from app.models.llm_preset import LLMPreset
 from app.models.llm_profile import LLMProfile
+from app.models.llm_task_preset import LLMTaskPreset
 from app.models.project import Project
 from app.models.project_membership import ProjectMembership
 from app.models.user import User
@@ -72,6 +73,7 @@ class TestLlmProfileSyncPresetDefaults(unittest.TestCase):
                 ProjectMembership.__table__,
                 LLMProfile.__table__,
                 LLMPreset.__table__,
+                LLMTaskPreset.__table__,
             ],
         )
         self.SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
@@ -84,15 +86,29 @@ class TestLlmProfileSyncPresetDefaults(unittest.TestCase):
             db.add(Project(id="p1", owner_user_id="u_owner", name="Project 1", genre=None, logline=None))
             db.commit()
 
-    def _create_profile(self, *, name: str, model: str) -> str:
+    def _create_profile(
+        self,
+        *,
+        name: str,
+        provider: str = "openai",
+        model: str,
+        max_tokens: int | None = None,
+        timeout_seconds: int | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
+    ) -> str:
         res = self.client.post(
             "/api/llm_profiles",
             headers=self.headers,
             json={
                 "name": name,
-                "provider": "openai",
+                "provider": provider,
                 "base_url": None,
                 "model": model,
+                "max_tokens": max_tokens,
+                "timeout_seconds": timeout_seconds,
+                "temperature": temperature,
+                "top_p": top_p,
             },
         )
         self.assertEqual(res.status_code, 200)
@@ -132,8 +148,29 @@ class TestLlmProfileSyncPresetDefaults(unittest.TestCase):
         self.assertEqual(res.status_code, 200)
         return dict(res.json()["data"]["llm_preset"])
 
-    def test_profile_update_does_not_reset_saved_advanced_params(self) -> None:
-        profile_id = self._create_profile(name="Main", model="gpt-4o-mini")
+    def _create_task_preset(self, *, profile_id: str, provider: str, model: str) -> None:
+        with self.SessionLocal() as db:
+            db.add(
+                LLMTaskPreset(
+                    project_id="p1",
+                    task_key="chapter_generate",
+                    llm_profile_id=profile_id,
+                    provider=provider,
+                    base_url="https://api.openai.com/v1" if provider == "openai" else "https://api.anthropic.com",
+                    model=model,
+                    temperature=0.3,
+                    top_p=0.9,
+                    max_tokens=4096,
+                    top_k=None,
+                    stop_json="[]",
+                    timeout_seconds=180,
+                    extra_json="{}",
+                )
+            )
+            db.commit()
+
+    def test_profile_update_syncs_full_template_to_bound_project_preset(self) -> None:
+        profile_id = self._create_profile(name="Main", model="gpt-4o-mini", max_tokens=4096, timeout_seconds=240)
         self._bind_project_profile(profile_id)
         self._save_custom_preset(max_tokens=8192, timeout_seconds=321)
 
@@ -144,18 +181,24 @@ class TestLlmProfileSyncPresetDefaults(unittest.TestCase):
                 "provider": "openai",
                 "base_url": None,
                 "model": "gpt-4o",
+                "temperature": 0.23,
+                "top_p": 0.81,
+                "max_tokens": 3072,
+                "timeout_seconds": 222,
             },
         )
         self.assertEqual(update.status_code, 200)
 
         preset = self._get_preset()
         self.assertEqual(preset["model"], "gpt-4o")
-        self.assertEqual(preset["max_tokens"], 8192)
-        self.assertEqual(preset["timeout_seconds"], 321)
+        self.assertEqual(preset["temperature"], 0.23)
+        self.assertEqual(preset["top_p"], 0.81)
+        self.assertEqual(preset["max_tokens"], 3072)
+        self.assertEqual(preset["timeout_seconds"], 222)
 
-    def test_project_profile_switch_keeps_saved_advanced_params(self) -> None:
-        profile_a = self._create_profile(name="Profile A", model="gpt-4o-mini")
-        profile_b = self._create_profile(name="Profile B", model="gpt-4.1-mini")
+    def test_project_profile_switch_applies_target_profile_template(self) -> None:
+        profile_a = self._create_profile(name="Profile A", model="gpt-4o-mini", max_tokens=8192, timeout_seconds=444)
+        profile_b = self._create_profile(name="Profile B", model="gpt-4.1-mini", max_tokens=1536, timeout_seconds=96)
 
         self._bind_project_profile(profile_a)
         self._save_custom_preset(max_tokens=8192, timeout_seconds=444)
@@ -169,8 +212,8 @@ class TestLlmProfileSyncPresetDefaults(unittest.TestCase):
 
         preset = self._get_preset()
         self.assertEqual(preset["model"], "gpt-4.1-mini")
-        self.assertEqual(preset["max_tokens"], 8192)
-        self.assertEqual(preset["timeout_seconds"], 444)
+        self.assertEqual(preset["max_tokens"], 1536)
+        self.assertEqual(preset["timeout_seconds"], 96)
 
     def test_binding_profile_creates_preset_with_updated_defaults(self) -> None:
         profile_id = self._create_profile(name="Defaults", model="gpt-4o-mini")
@@ -180,6 +223,43 @@ class TestLlmProfileSyncPresetDefaults(unittest.TestCase):
         self.assertEqual(preset["timeout_seconds"], 180)
         self.assertEqual(preset["max_tokens"], default_max_tokens("openai", "gpt-4o-mini"))
         self.assertEqual(preset["max_tokens"], 12000)
+
+    def test_profile_update_syncs_bound_task_preset_full_template(self) -> None:
+        profile_id = self._create_profile(name="Task Profile", model="gpt-4o-mini")
+        self._bind_project_profile(profile_id)
+        self._create_task_preset(profile_id=profile_id, provider="openai", model="gpt-4o-mini")
+
+        update = self.client.put(
+            f"/api/llm_profiles/{profile_id}",
+            headers=self.headers,
+            json={
+                "provider": "anthropic",
+                "base_url": None,
+                "model": "claude-3-7-sonnet-20250219",
+                "temperature": 0.12,
+                "top_p": 0.88,
+                "max_tokens": 2048,
+                "top_k": 32,
+                "stop": ["END"],
+                "timeout_seconds": 520,
+                "extra": {"foo": "bar"},
+            },
+        )
+        self.assertEqual(update.status_code, 200)
+
+        with self.SessionLocal() as db:
+            row = db.get(LLMTaskPreset, ("p1", "chapter_generate"))
+            self.assertIsNotNone(row)
+            self.assertEqual(row.provider, "anthropic")
+            self.assertEqual(row.model, "claude-3-7-sonnet-20250219")
+            self.assertEqual(row.base_url, "https://api.anthropic.com")
+            self.assertEqual(row.temperature, 0.12)
+            self.assertEqual(row.top_p, 0.88)
+            self.assertEqual(row.max_tokens, 2048)
+            self.assertEqual(row.top_k, 32)
+            self.assertEqual(row.stop_json, '["END"]')
+            self.assertEqual(row.timeout_seconds, 520)
+            self.assertEqual(row.extra_json, '{"foo": "bar"}')
 
 
 if __name__ == "__main__":
